@@ -1,0 +1,322 @@
+import json
+import math
+import random
+import os
+import sys
+import collections
+import pandas as pd
+from collections import Counter, defaultdict
+
+
+def read_corpus(file_path):
+    # read jsonl file and return 2 DF
+    data = []
+    with open(file_path, 'r', encoding='utf-8') as f:
+        for line in f:
+            obj = json.loads(line)
+            protocol_type = obj['protocol_type'].strip().lower()
+            sentence_text = obj['sentence_text'].strip()
+            data.append((protocol_type, sentence_text))
+    df = pd.DataFrame(data, columns=['protocol_type', 'sentence_text'])
+    committee_df = df[df.protocol_type == 'committee'].copy()
+    plenary_df = df[df.protocol_type == 'plenary'].copy()
+    return committee_df, plenary_df
+
+
+class TrigramLanguageModel:
+    def __init__(self, sentences, lambdas):
+        self.l1, self.l2, self.l3 = lambdas
+        # initialize counters for each ngram
+        self.unigram_counts = Counter()
+        self.bigram_counts = Counter()
+        self.trigram_counts = Counter()
+
+        for s in sentences:
+            # add 2 special tokens at the start of each sentence
+            tokens = ['s_0', 's_1'] + s.strip().split()
+            # update the counts for each sentence by its tokens
+            self.unigram_counts.update(tokens)
+            self.bigram_counts.update(zip(tokens[:-1], tokens[1:]))
+            self.trigram_counts.update(zip(tokens[:-2], tokens[1:-1], tokens[2:]))
+
+        # sum up the corpus's size
+        self.vocab_size = len(self.unigram_counts)
+        self.total_unigrams = sum(self.unigram_counts.values())
+
+    def _laplace_smooth(self, count, context_count):
+        # laplace smoothing: (count+1)/(context_count+vocab_size)
+        return (count + 1) / (context_count + self.vocab_size)
+
+    def calculate_prob_of_sentence(self, sentence):
+        # calculates the log probability (base e) of a sentence
+        # uses the trigram model with interpolation
+        tokens = ['s_0', 's_1'] + sentence.strip().split()
+        log_prob = 0.0
+        for i in range(2, len(tokens)):
+            w1, w2, w3 = tokens[i-2], tokens[i-1], tokens[i]
+            p_uni = self._laplace_smooth(self.unigram_counts[w3], self.total_unigrams)
+            p_bi = self._laplace_smooth(self.bigram_counts.get((w2, w3), 0), self.unigram_counts.get(w2, 0))
+            p_tri = self._laplace_smooth(self.trigram_counts.get((w1, w2), {}).get(w3, 0),
+                                         self.bigram_counts.get((w1, w2), 0))
+            prob = self.l1 * p_uni + self.l2 * p_bi + self.l3 * p_tri
+            log_prob += math.log(prob)
+        return log_prob
+
+    def generate_next_token(self, context, is_final=False):
+        # given context, we want to predict the next token.
+        # we add s0, s1 to make sure we have at least 2 tokens before our prediction.
+        tokens = ['s_0', 's_1'] + context.strip().split()
+        w1, w2 = tokens[-2], tokens[-1]
+
+        max_token = None
+        max_prob = -1.0
+
+        for w3 in self.unigram_counts:
+            # we don't want to calculate the prob of w3 to be s0 or s1
+            if w3 in ('s_0', 's_1'):
+                continue
+            p_uni = (self.unigram_counts[w3] + 1) / (self.total_unigrams + self.vocab_size)
+            p_bi = (self.bigram_counts.get((w2, w3), 0) + 1) / (self.unigram_counts.get(w2, 0) + self.vocab_size)
+            p_tri = (self.trigram_counts.get((w1, w2), {}).get(w3, 0) + 1) / (self.bigram_counts.get((w1, w2), 0) + self.vocab_size)
+
+            # applying chain rule: p(w3 | w1, w2) = p(w3) + p(w3|w2) + p(w3 | w1, w2)
+            # add lambdas weights
+            prob = self.l1 * p_uni + self.l2 * p_bi + self.l3 * p_tri
+            if prob > max_prob:
+                # save max prob and w3
+                max_prob = prob
+                max_token = w3
+
+        # edge case, if we try to predict the last token in a sentence, we will choose '.' over ',' .
+        if is_final and max_token == ',':
+            max_token = '.'
+
+        return max_token, math.log(max_prob)
+
+
+def mask_tokens(sentences):
+    masked = []
+    for s in sentences:
+        tokens = s.strip().split()
+        # mask 10% and at least 1
+        num_to_mask = max(1, int(len(tokens) * 0.1))
+        # take random indices to mask
+        indices = random.sample(range(len(tokens)), num_to_mask)
+        for i in indices:
+            tokens[i] = '[*]'
+        masked.append(' '.join(tokens))
+    return masked
+
+
+def get_k_n_t_collocations(k, n, t, corpus_df, metric_type):
+    # get the sentences from the df
+    docs = corpus_df["sentence_text"].tolist()
+    # docs is a list of all sentences tokenized
+
+    ngram_counts = Counter()  # will hold counts of each ngram
+    doc_counts = defaultdict(int)  # will hold the number of documents each ngram appears in
+
+    for doc in docs:
+        # split the sentence to tokens
+        tokens = doc.strip().split()
+
+        # get all ngrams from the tokens.
+        ngs = list(zip(*[tokens[i:] for i in range(n)]))
+
+        # update global ngram frequency counts
+        ngram_counts.update(ngs)
+
+        # count all the unique ngrams
+        unique_ngrams = set(ngs)
+        for ng in unique_ngrams:
+            doc_counts[ng] += 1
+
+    if metric_type == "frequency":
+        # filter ngrams that occur at least t times
+        filtered = [(ngram, count) for ngram, count in ngram_counts.items() if count >= t]
+        # sort by frequency (descending) and return top k
+        return sorted(filtered, key=lambda x: x[1], reverse=True)[:k]
+
+    elif metric_type == "tfidf":
+        total_docs = len(docs)
+        # total_terms is the sum of counts of all ngrams in the corpus
+        total_terms = sum(ngram_counts.values())
+
+        tfidf_scores = []
+        for ngram, count in ngram_counts.items():
+            if count >= t:
+                # calculate tf: ratio of ngram's count to total terms
+                tf = 0
+                if total_terms > 0:
+                    tf = count / total_terms
+
+                # calculate idf
+                idf = math.log(total_docs / (1 + doc_counts[ngram]))
+
+                # tf-idf score for this ngram
+                score = tf * idf
+                tfidf_scores.append((ngram, score))
+
+        # sort by tf-idf score (descending) and return top k
+        return sorted(tfidf_scores, key=lambda x: x[1], reverse=True)[:k]
+
+
+def write_collocations_to_file(collocations, file_path):
+    # write the collocations in the file path provided
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for ngram_type, metrics in collocations.items():
+            f.write(f"{ngram_type} collocations:\n")
+            # frequency
+            f.write("Frequency:\n")
+            f.write("Committee corpus:\n")
+            for ng,score in metrics["Frequency"]["Committee"]:
+                ngram_str=' '.join(ng)
+                f.write(f"{ngram_str}\n")
+            f.write("\n")
+            f.write("Plenary corpus:\n")
+            for ng,score in metrics["Frequency"]["Plenary"]:
+                ngram_str=' '.join(ng)
+                f.write(f"{ngram_str}\n")
+            f.write("\n")
+
+            # TF-IDF
+            f.write("TF-IDF:\n")
+            f.write("Committee corpus:\n")
+            for ng,score in metrics["TF-IDF"]["Committee"]:
+                ngram_str=' '.join(ng)
+                f.write(f"{ngram_str}\n")
+            f.write("\n")
+            f.write("Plenary corpus:\n")
+            for ng,score in metrics["TF-IDF"]["Plenary"]:
+                ngram_str=' '.join(ng)
+                f.write(f"{ngram_str}\n")
+            f.write("\n")
+
+
+def write_sampled_sentences_to_files(original, masked, output_dir):
+    # writes the original and masked sentences to the output file
+    with open(os.path.join(output_dir, 'original_sampled_sents.txt'), 'w', encoding='utf-8') as f:
+        for sentence in original:
+            f.write(sentence + '\n')
+
+    with open(os.path.join(output_dir, 'masked_sampled_sents.txt'), 'w', encoding='utf-8') as f:
+        for sentence in masked:
+            f.write(sentence + '\n')
+
+
+def write_results_to_file(results, file_path):
+    # writes the prediction results to a file
+    with open(file_path, 'w', encoding='utf-8') as f:
+        for result in results:
+            f.write(f"original_sentence: {result['original']}\n")
+            f.write(f"masked_sentence: {result['masked']}\n")
+            f.write(f"plenary_sentence: {result['plenary']}\n")
+            f.write(f"plenary_tokens: {', '.join(result['tokens'])}\n")
+            f.write(f"probability of plenary sentence in plenary corpus: {result['prob_plenary_in_plenary']:.2f}\n")
+            f.write(f"probability of plenary sentence in committee corpus: {result['prob_plenary_in_committee']:.2f}\n\n")
+
+
+def compute_perplexity(probs):
+    N = len(probs)  # num of tokens
+
+    # sum of log probabilities
+    log_sum = sum(probs)
+
+    perplexity = math.exp(-log_sum / N)
+    return perplexity
+
+
+def main(corpus_file, output_dir):
+    # read corpus
+    committee_df, plenary_df = read_corpus(corpus_file)
+    # set seed for consistency
+    random.seed(42)
+    # set lambdas
+    lambdas = (0.04, 0.24, 0.72)
+
+    # create committee and plenary models
+    committee_model = TrigramLanguageModel(committee_df['sentence_text'], lambdas)
+    plenary_model = TrigramLanguageModel(plenary_df['sentence_text'], lambdas)
+
+    # get collocations
+    two_freq_comm  = get_k_n_t_collocations(10,2,5,committee_df,"frequency")
+    two_freq_plen  = get_k_n_t_collocations(10,2,5,plenary_df,"frequency")
+    two_tfidf_comm = get_k_n_t_collocations(10,2,5,committee_df,"tfidf")
+    two_tfidf_plen = get_k_n_t_collocations(10,2,5,plenary_df,"tfidf")
+
+    three_freq_comm= get_k_n_t_collocations(10,3,5,committee_df,"frequency")
+    three_freq_plen= get_k_n_t_collocations(10,3,5,plenary_df,"frequency")
+    three_tfidf_comm= get_k_n_t_collocations(10,3,5,committee_df,"tfidf")
+    three_tfidf_plen= get_k_n_t_collocations(10,3,5,plenary_df,"tfidf")
+
+    four_freq_comm= get_k_n_t_collocations(10,4,5,committee_df,"frequency")
+    four_freq_plen= get_k_n_t_collocations(10,4,5,plenary_df,"frequency")
+    four_tfidf_comm= get_k_n_t_collocations(10,4,5,committee_df,"tfidf")
+    four_tfidf_plen= get_k_n_t_collocations(10,4,5,plenary_df,"tfidf")
+
+    collocations_data = {
+        "Two-gram":{
+            "Frequency":{"Committee":two_freq_comm,"Plenary":two_freq_plen},
+            "TF-IDF":{"Committee":two_tfidf_comm,"Plenary":two_tfidf_plen}
+        },
+        "Three-gram":{
+            "Frequency":{"Committee":three_freq_comm,"Plenary":three_freq_plen},
+            "TF-IDF":{"Committee":three_tfidf_comm,"Plenary":three_tfidf_plen}
+        },
+        "Four-gram":{
+            "Frequency":{"Committee":four_freq_comm,"Plenary":four_freq_plen},
+            "TF-IDF":{"Committee":four_tfidf_comm,"Plenary":four_tfidf_plen}
+        }
+    }
+
+    write_collocations_to_file(collocations_data, os.path.join(output_dir,'collocations_knesset.txt'))
+
+    # sample 10 committee sentences that has at least 5 words in them
+    sample_sentences = random.sample([s for s in committee_df['sentence_text'].tolist() if len(s.split()) >= 5], 10)
+    # mask 10% of tokens
+    masked_sentences = mask_tokens(sample_sentences)
+    write_sampled_sentences_to_files(sample_sentences, masked_sentences, output_dir)
+
+    # fill masked tokens using plenary model
+    filled_sentences = []
+    results = []
+    probs = []
+    for masked, original in zip(masked_sentences, sample_sentences):
+        tokens = masked.split()
+        filled = tokens[:]
+        generated_tokens = []
+        for i, token in enumerate(tokens):
+            if token == '[*]':
+                context = ' '.join(filled[:i])
+                # check if final token
+                is_final_token = (i == len(tokens)-1)
+                next_token, log_prob = plenary_model.generate_next_token(context, is_final_token)
+                filled[i] = next_token
+                probs.append(log_prob)
+                generated_tokens.append(next_token)  # save the next token in the list
+
+        filled_sentence = ' '.join(filled)
+        filled_sentences.append(filled_sentence)
+        results.append({
+            'original': original,
+            'masked': masked,
+            'plenary': filled_sentence,
+            'tokens': generated_tokens,
+            'prob_plenary_in_plenary': plenary_model.calculate_prob_of_sentence(filled_sentence),
+            'prob_plenary_in_committee': committee_model.calculate_prob_of_sentence(filled_sentence)
+        })
+
+    write_results_to_file(results, os.path.join(output_dir, 'sampled_sents_results.txt'))
+
+    # compute perplexity
+    perplexity = compute_perplexity(probs)
+    with open(os.path.join(output_dir, 'perplexity_result.txt'), 'w', encoding='utf-8') as f:
+        f.write(f'{perplexity:.2f}\n')
+
+
+if __name__ == '__main__':
+
+    corpus_file = sys.argv[1]
+    output_dir = sys.argv[2]
+
+    main(corpus_file, output_dir)
