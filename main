@@ -16,8 +16,9 @@ def read_corpus(file_path):
             obj = json.loads(line)
             protocol_type = obj['protocol_type'].strip().lower()
             sentence_text = obj['sentence_text'].strip()
-            data.append((protocol_type, sentence_text))
-    df = pd.DataFrame(data, columns=['protocol_type', 'sentence_text'])
+            protocol_name = obj['protocol_name'].strip()
+            data.append((protocol_type, sentence_text, protocol_name))
+    df = pd.DataFrame(data, columns=['protocol_type', 'sentence_text', 'protocol_name'])
     committee_df = df[df.protocol_type == 'committee'].copy()
     plenary_df = df[df.protocol_type == 'plenary'].copy()
     return committee_df, plenary_df
@@ -56,7 +57,7 @@ class TrigramLM:
             w1, w2, w3 = tokens[i-2], tokens[i-1], tokens[i]
             p_uni = self._laplace_smooth(self.unigram_counts[w3], self.total_unigrams)
             p_bi = self._laplace_smooth(self.bigram_counts.get((w2, w3), 0), self.unigram_counts.get(w2, 0))
-            p_tri = self._laplace_smooth(self.trigram_counts.get((w1, w2), {}).get(w3, 0),
+            p_tri = self._laplace_smooth(self.trigram_counts.get((w1, w2, w3), 0),
                                          self.bigram_counts.get((w1, w2), 0))
             prob = self.l1 * p_uni + self.l2 * p_bi + self.l3 * p_tri
             log_prob += math.log(prob)
@@ -78,7 +79,7 @@ class TrigramLM:
             # calculate the probabilities using laplace smoothing
             p_uni = (self.unigram_counts[w3] + 1) / (self.total_unigrams + self.vocab_size)
             p_bi = (self.bigram_counts.get((w2, w3), 0) + 1) / (self.unigram_counts.get(w2, 0) + self.vocab_size)
-            p_tri = (self.trigram_counts.get((w1, w2), {}).get(w3, 0) + 1) / (self.bigram_counts.get((w1, w2), 0) + self.vocab_size)
+            p_tri = (self.trigram_counts.get((w1, w2, w3), 0) + 1) / (self.bigram_counts.get((w1, w2), 0) + self.vocab_size)
 
             # applying chain rule: p(w3 | w1, w2) = p(w3) + p(w3|w2) + p(w3 | w1, w2)
             # add lambdas weights
@@ -95,12 +96,12 @@ class TrigramLM:
         return max_token, math.log(max_prob)
 
 
-def mask_tokens(sentences):
+def mask_tokens_in_sentences(sentences, x):
     masked = []
     for s in sentences:
         tokens = s.strip().split()
         # mask 10% and at least 1
-        num_to_mask = max(1, int(len(tokens) * 0.1))
+        num_to_mask = max(1, int(len(tokens) * x))
         # take random indices to mask
         indices = random.sample(range(len(tokens)), num_to_mask)
         for i in indices:
@@ -109,56 +110,66 @@ def mask_tokens(sentences):
     return masked
 
 
-def get_k_n_t_collocations(k, n, t, corpus_df, metric_type):
-    # get the sentences from the df
-    sentences = corpus_df["sentence_text"].tolist()
-    # docs is a list of all sentences tokenized
+def get_k_n_t_collocations(k, n, t_h, corpus_df, metric_type):
+    # get the sentences and protocol name from the df
+    sentences = list(zip(corpus_df["protocol_name"], corpus_df["sentence_text"]))
 
-    ngram_counts = Counter()  # will hold counts of each ngram
-    doc_counts = defaultdict(int)  # will hold the number of documents each ngram appears in
+    # counts ngram per protocol
+    protocol_ngrams = defaultdict(Counter)
+    # count how many times each ngram appears in total
+    total_ngram_counts = Counter()
 
-    for sentence in sentences:
-        # split the sentence to tokens
-        tokens = sentence.strip().split()
-
-        # get all ngrams from the tokens.
+    for protocol_name, sentence_text in sentences:
+        tokens = sentence_text.strip().split()
+        # generate ngrams for the sentence
         ngs = list(zip(*[tokens[i:] for i in range(n)]))
+        # update this protocol's ngram counts
+        protocol_ngrams[protocol_name].update(ngs)
 
-        # update global ngram frequency counts
-        ngram_counts.update(ngs)
+    # doc_counts: number of distinct protocols containing the ngram
+    doc_counts = defaultdict(int)
 
-        # count all the unique ngrams
-        unique_ngrams = set(ngs)
-        for ng in unique_ngrams:
+    # go throw each protocol
+    for protocol_name, ngram_counter in protocol_ngrams.items():
+        # add total_ngram_counts
+        for ng, count in ngram_counter.items():
+            total_ngram_counts[ng] += count
+        for ng in ngram_counter.keys():
             doc_counts[ng] += 1
 
+    # number of protocols in corpus
+    total_protocols = len(protocol_ngrams)
+
     if metric_type == "frequency":
-        # filter ngrams that occur at least t times
-        filtered = [(ngram, count) for ngram, count in ngram_counts.items() if count >= t]
-        # sort by frequency (descending) and return top k
+        filtered = [(ngram, count) for ngram, count in total_ngram_counts.items() if count >= t_h]
         return sorted(filtered, key=lambda x: x[1], reverse=True)[:k]
 
     elif metric_type == "tfidf":
-        total_docs = len(sentences)
-        # total_terms is the sum of counts of all ngrams in the corpus
-        total_terms = sum(ngram_counts.values())
 
         tfidf_scores = []
-        for ngram, count in ngram_counts.items():
-            if count >= t:
-                # calculate tf: ratio of ngram's count to total terms
-                tf = 0
-                if total_terms > 0:
-                    tf = count / total_terms
 
-                # calculate idf
-                idf = math.log(total_docs / (1 + doc_counts[ngram]))
+        # compute IDF for each ngram
+        idf_values = {}
+        for ng in total_ngram_counts:
+            # if the ngram do not reach the threshold, continue
+            if total_ngram_counts[ng] < t_h:
+                continue
+            idf_values[ng] = math.log(total_protocols / (doc_counts[ng] + 1))
 
-                # tf-idf score for this ngram
-                score = tf * idf
-                tfidf_scores.append((ngram, score))
+        for ng in idf_values:
+            idf = idf_values[ng]
+            score = 0.0
+            # compute TF-IDF from all protocols that contain this ng
+            for protocol_name, ngram_counter in protocol_ngrams.items():
+                if ng in ngram_counter:
+                    # compute TF for this ng in this protocol
+                    doc_total_terms = sum(ngram_counter.values())
+                    tf = ngram_counter[ng] / doc_total_terms
+                    score += (tf * idf)
 
-        # sort by tf-idf score (descending) and return top k
+            tfidf_scores.append((ng, score))
+
+        # sort by TF-IDF score
         return sorted(tfidf_scores, key=lambda x: x[1], reverse=True)[:k]
 
 
@@ -236,8 +247,8 @@ def main(corpus_file, output_dir):
     lambdas = (0.04, 0.24, 0.72)
 
     # create committee and plenary models
-    committee_model = TrigramLanguageModel(committee_df['sentence_text'], lambdas)
-    plenary_model = TrigramLanguageModel(plenary_df['sentence_text'], lambdas)
+    committee_model = TrigramLM(committee_df['sentence_text'], lambdas)
+    plenary_model = TrigramLM(plenary_df['sentence_text'], lambdas)
 
     # get collocations
     two_freq_comm  = get_k_n_t_collocations(10,2,5,committee_df,"frequency")
@@ -275,7 +286,7 @@ def main(corpus_file, output_dir):
     # sample 10 committee sentences that has at least 5 words in them
     sample_sentences = random.sample([s for s in committee_df['sentence_text'].tolist() if len(s.split()) >= 5], 10)
     # mask 10% of tokens
-    masked_sentences = mask_tokens(sample_sentences)
+    masked_sentences = mask_tokens_in_sentences(sample_sentences, 0.1)
     write_sampled_sentences_to_files(sample_sentences, masked_sentences, output_dir)
 
     # fill masked tokens using plenary model
